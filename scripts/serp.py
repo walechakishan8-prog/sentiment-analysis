@@ -4,15 +4,17 @@ import json
 import traceback
 from datetime import datetime
 
-def safe_get_nested(data, *keys, default=None):
-    """Safely get nested dictionary values"""
-    current = data
-    for key in keys:
-        if isinstance(current, dict) and key in current:
-            current = current[key]
-        else:
-            return default
-    return current
+def test_extract_reviews_uses_snippet_when_extracted_snippet_missing():
+    result = {
+        "user": {"name": "Guest User"},
+        "rating": 5,
+        "date": "2026-07-27",
+        "snippet": "Fallback review text"
+    }
+
+    review_text = safe_get_nested(result, "extracted_snippet", "original", default=None) or result.get("snippet", "")
+
+    assert review_text == "Fallback review text"
 
 def save_data_to_json(data, filename_prefix="reviews_data"):
     """Save data to JSON file with timestamp"""
@@ -66,7 +68,10 @@ def extract_reviews():
                                 "snippet": result.get("snippet", ""),
                                 "images": result.get("images", []),
                                 "local_guide": safe_get_nested(result, "user", "local_guide", default=False),
-                                "text": safe_get_nested(result, "extracted_snippet", "original", default=""),
+                                "text": (
+                                    safe_get_nested(result, "extracted_snippet", "original", default=None)
+                                    or result.get("snippet", "")
+                                ),
                             }
                             reviews.append(review_data)
                             
@@ -113,6 +118,17 @@ def extract_reviews():
                         # Update search params for next page
                         next_url = pagination["next"]
                         search.params_dict.update(dict(parse_qsl(urlsplit(next_url).query)))
+                    elif pagination.get("next") and not pagination.get("next_page_token"):
+                        logger.warning(
+                            "ERR_SERP_PAGINATION_TOKEN_EXPIRED: next page exists but token is unavailable",
+                            extra={"page": page_num},
+                        )
+                        errors.append({
+                            "page": page_num,
+                            "error": "ERR_SERP_PAGINATION_TOKEN_EXPIRED",
+                            "timestamp": datetime.now(timezone.utc).isoformat()
+                        })
+                        break
                     else:
                         print("No more pages to process.")
                         break
@@ -127,15 +143,15 @@ def extract_reviews():
                     })
                     break
                     
-            except Exception as e:
-                error_msg = f"Error fetching page {page_num}: {e}"
-                print(error_msg)
-                errors.append({
-                    "page": page_num,
-                    "error": error_msg,
-                    "traceback": traceback.format_exc()
-                })
-                break
+                except Exception as e:
+                    error_msg = f"Error fetching page {page_num}: {e}"
+                    logger.exception(error_msg, extra={"page": page_num})
+                    errors.append({
+                        "page": page_num,
+                        "error": error_msg,
+                        "traceback": traceback.format_exc()
+                    })
+                    break
                 
     except KeyboardInterrupt:
         print("Process interrupted by user.")
@@ -171,12 +187,15 @@ def extract_reviews():
     saved_file = save_data_to_json(final_data)
     
     # Print summary
-    print(f"\n=== EXTRACTION SUMMARY ===")
-    print(f"Total reviews extracted: {len(reviews)}")
-    print(f"Total pages processed: {page_num}")
-    print(f"Errors encountered: {len(errors)}")
-    if saved_file:
-        print(f"Data saved to: {saved_file}")
+    logger.info(
+        "Extraction summary",
+        extra={
+            "total_reviews": len(reviews),
+            "total_pages_processed": page_num,
+            "error_count": len(errors),
+            "saved_file": saved_file,
+        },
+    )
     
     # Also print the JSON to console (optional, you can remove this if files get too large)
     print(f"\n=== JSON OUTPUT ===")

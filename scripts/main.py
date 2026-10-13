@@ -74,6 +74,11 @@ class ReviewSentimentAnalyzer:
         # Fallback: generate ID from name and date
         name = review.get('name', 'unknown')
         date = review.get('date', 'unknown')
+            safe_author = self._mask_author(review.get('name', ''))
+            logger.warning(
+                "Missing date field on review; review_id will use deterministic fallback",
+                extra={"author_hash": safe_author},
+            )
         return f"{name}_{date}".replace(' ', '_').replace('/', '_')
 
     
@@ -154,7 +159,7 @@ RESPOND WITH ONLY VALID JSON IN THIS EXACT FORMAT:
                     time.sleep(wait_time)
                 
                 response = self.client.chat.completions.create(
-                    model="gpt-4",
+                    model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
                     messages=[
                         {
                             "role": "system", 
@@ -165,8 +170,9 @@ RESPOND WITH ONLY VALID JSON IN THIS EXACT FORMAT:
                             "content": prompt
                         }
                     ],
-                    temperature=0.3,
-                    max_tokens=1000
+                    temperature=0.0,
+                    max_tokens=1500,
+                    response_format={"type": "json_object"}
                 )
                 
                 # Get raw response
@@ -176,13 +182,7 @@ RESPOND WITH ONLY VALID JSON IN THIS EXACT FORMAT:
                 
                 # Clean and parse the JSON response
                 cleaned_response = self._clean_openai_response(raw_response)
-                analysis_result = json.loads(cleaned_response)
-                
-                # Validate required fields
-                required_fields = ['sentiment', 'confidence', 'sentiment_score', 'dimensions', 'key_themes', 'severity', 'summary']
-                for field in required_fields:
-                    if field not in analysis_result:
-                        analysis_result[field] = [] if field in ['dimensions', 'key_themes'] else 0 if field in ['confidence', 'sentiment_score', 'severity'] else 'unknown'
+                analysis_result = self._normalise_analysis_result(json.loads(cleaned_response))
                 
                 # Extract review ID
                 review_id = self._extract_review_id(review)
@@ -504,6 +504,8 @@ Generate a summary in the following JSON format:
         analyzed_reviews = []
         failed_count = 0
         
+        rate_limit_delay = max(rate_limit_delay, self.request_delay_seconds)
+
         for i, review in enumerate(reviews):
             print(f"Processing review {i+1}/{len(reviews)}")
             
@@ -621,9 +623,21 @@ Generate a summary in the following JSON format:
 
 def load_reviews_from_file(file_path: str) -> List[Dict[str, Any]]:
     """Load reviews from JSON file - handles the new input format"""
+    max_input_bytes = int(os.getenv("REVIEWS_INPUT_MAX_BYTES", str(25 * 1024 * 1024)))
+    if Path(file_path).stat().st_size > max_input_bytes:
+        raise ValueError(f"Input file exceeds REVIEWS_INPUT_MAX_BYTES={max_input_bytes}: {file_path}")
+
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except UnicodeDecodeError as e:
+            logger.error(
+                "ERR_REVIEW_FILE_ENCODING: replacing invalid UTF-8 bytes while loading reviews",
+                extra={"file_path": file_path, "error": str(e)},
+            )
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                data = json.load(f)
         
         # Handle the new JSON structure
         if isinstance(data, dict) and 'reviews' in data:
